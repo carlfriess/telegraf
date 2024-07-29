@@ -120,14 +120,16 @@ func (e *EventHub) Start(accumulator telegraf.Accumulator) error {
 		return err
 	}
 
+	// Create a context for the processor to run in, so we can cancel it later
+	var processorCtx context.Context
+	processorCtx, e.processorCancel = context.WithCancel(context.Background())
+
 	// Run in the background, launching goroutines to process each partition
 	go e.dispatchPartitionClients(processor)
 
 	// Run the load balancer. The dispatchPartitionClients goroutine (launched above)
 	// will receive and dispatch ProcessorPartitionClients as partitions are claimed.
 	go func() {
-		var processorCtx context.Context
-		processorCtx, e.processorCancel = context.WithCancel(context.Background())
 		if err := processor.Run(processorCtx); err != nil {
 			e.Log.Errorf("Error running Event Hub processor: %v", err)
 		}
@@ -143,6 +145,7 @@ func (e *EventHub) dispatchPartitionClients(processor *azeventhubs.Processor) {
 			// Processor has stopped
 			break
 		}
+		e.partitionGroup.Add(1)
 		go e.processEventsForPartition(processorPartitionClient)
 	}
 }
@@ -154,6 +157,7 @@ func (e *EventHub) processEventsForPartition(partitionClient *azeventhubs.Proces
 		if err != nil {
 			e.Log.Errorf("Error closing partition client: %v", err)
 		}
+		e.partitionGroup.Done()
 	}()
 
 	e.Log.Infof("Starting to receive for partition %s", partitionClient.PartitionID())
@@ -165,9 +169,10 @@ func (e *EventHub) processEventsForPartition(partitionClient *azeventhubs.Proces
 		if err != nil && !errors.Is(err, context.DeadlineExceeded) {
 			var eventHubError *azeventhubs.Error
 			if errors.As(err, &eventHubError) && eventHubError.Code == azeventhubs.ErrorCodeOwnershipLost {
+				e.Log.Infof("Ownership lost for partition %s", partitionClient.PartitionID())
 				return
 			}
-			e.Log.Errorf("Error receiving events on partition %s: %v", partitionClient.PartitionID(), err)
+			e.Log.Warnf("Error receiving events on partition %s: %v", partitionClient.PartitionID(), err)
 			return
 		}
 
@@ -262,6 +267,7 @@ func (e *EventHub) createMetrics(event *azeventhubs.ReceivedEventData) ([]telegr
 func (e *EventHub) Stop() {
 	e.Log.Info("Stopping Event Hub consumer")
 	e.processorCancel()
+	e.partitionGroup.Wait()
 	err := e.consumerClient.Close(context.Background())
 	if err != nil {
 		e.Log.Errorf("Error closing Event Hub connection: %v", err)
