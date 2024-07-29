@@ -30,6 +30,7 @@ type EventHub struct {
 	StorageConnectionString string `toml:"checkpoint_connection_string"`
 	StorageContainerName    string `toml:"checkpoint_container_name"`
 
+	PrefetchSize  int32         `toml:"prefetch_size"`
 	BatchInterval time.Duration `toml:"batch_interval"`
 	BatchSize     int           `toml:"batch_size"`
 
@@ -54,6 +55,7 @@ type EventHub struct {
 	checkpointStore *checkpoints.BlobStore
 	consumerClient  *azeventhubs.ConsumerClient
 	processorCancel context.CancelFunc
+	partitionGroup  sync.WaitGroup
 
 	parser telegraf.Parser
 }
@@ -111,7 +113,9 @@ func (e *EventHub) Start(accumulator telegraf.Accumulator) error {
 	// The Processor handles load balancing with other Processor instances, running in separate
 	// processes or even on separate machines. Each one will use the checkpointStore to coordinate
 	// state and ownership, dynamically.
-	processor, err := azeventhubs.NewProcessor(e.consumerClient, e.checkpointStore, nil)
+	processor, err := azeventhubs.NewProcessor(e.consumerClient, e.checkpointStore, &azeventhubs.ProcessorOptions{
+		Prefetch: e.PrefetchSize,
+	})
 	if err != nil {
 		return err
 	}
@@ -171,7 +175,7 @@ func (e *EventHub) processEventsForPartition(partitionClient *azeventhubs.Proces
 			continue
 		}
 
-		var metrics []telegraf.Metric
+		metrics := make([]telegraf.Metric, 0, len(events))
 		for _, event := range events {
 			if m, err := e.createMetrics(event); err == nil {
 				metrics = append(metrics, m...)
