@@ -23,6 +23,9 @@ var sampleConfig string
 
 var once sync.Once
 
+type empty struct{}
+type semaphore chan empty
+
 type EventHub struct {
 	ConnectionString string `toml:"eventhub_connection_string"`
 	ConsumerGroup    string `toml:"eventhub_consumer_group"`
@@ -30,9 +33,10 @@ type EventHub struct {
 	StorageConnectionString string `toml:"checkpoint_connection_string"`
 	StorageContainerName    string `toml:"checkpoint_container_name"`
 
-	PrefetchSize  int32         `toml:"prefetch_size"`
-	BatchInterval time.Duration `toml:"batch_interval"`
-	BatchSize     int           `toml:"batch_size"`
+	PrefetchSize          int32         `toml:"prefetch_size"`
+	BatchInterval         time.Duration `toml:"batch_interval"`
+	BatchSize             int           `toml:"batch_size"`
+	MaxUndeliveredBatches int           `toml:"max_undelivered_batches"`
 
 	// Metadata
 	EnqueuedTimeAsTs              bool     `toml:"enqueued_time_as_ts"`
@@ -60,6 +64,24 @@ type EventHub struct {
 	parser telegraf.Parser
 }
 
+type partitionState struct {
+	sync.Mutex
+	ac         telegraf.TrackingAccumulator
+	ctx        context.Context
+	cancel     context.CancelFunc
+	sem        semaphore
+	nextAdd    uint64
+	nextRemove uint64
+	idMap      map[telegraf.TrackingID]uint64
+	batchMap   map[uint64]batchInfo
+}
+
+type batchInfo struct {
+	metrics    []telegraf.Metric
+	checkpoint *azeventhubs.ReceivedEventData
+	delivered  bool
+}
+
 func (*EventHub) SampleConfig() string {
 	return sampleConfig
 }
@@ -81,7 +103,10 @@ func (e *EventHub) Init() (err error) {
 		e.BatchInterval = time.Second
 	}
 	if e.BatchSize == 0 {
-		e.BatchSize = 1024
+		e.BatchSize = 100
+	}
+	if e.MaxUndeliveredBatches == 0 {
+		e.MaxUndeliveredBatches = 1000
 	}
 	if e.ConsumerGroup == "" {
 		e.ConsumerGroup = azeventhubs.DefaultConsumerGroup
@@ -125,7 +150,7 @@ func (e *EventHub) Start(accumulator telegraf.Accumulator) error {
 	processorCtx, e.processorCancel = context.WithCancel(context.Background())
 
 	// Run in the background, launching goroutines to process each partition
-	go e.dispatchPartitionClients(processor)
+	go e.dispatchPartitionClients(processor, accumulator)
 
 	// Run the load balancer. The dispatchPartitionClients goroutine (launched above)
 	// will receive and dispatch ProcessorPartitionClients as partitions are claimed.
@@ -138,48 +163,55 @@ func (e *EventHub) Start(accumulator telegraf.Accumulator) error {
 	return nil
 }
 
-func (e *EventHub) dispatchPartitionClients(processor *azeventhubs.Processor) {
+func (e *EventHub) dispatchPartitionClients(processor *azeventhubs.Processor, ac telegraf.Accumulator) {
 	for {
 		processorPartitionClient := processor.NextPartitionClient(context.Background())
 		if processorPartitionClient == nil {
 			// Processor has stopped
 			break
 		}
-		e.partitionGroup.Add(1)
-		go e.processEventsForPartition(processorPartitionClient)
+
+		ps := e.newPartitionState(ac)
+		e.partitionGroup.Add(2)
+		go e.processEventsForPartition(processorPartitionClient, ps)
+		go e.updateCheckpointForPartition(processorPartitionClient, ps)
 	}
 }
 
-func (e *EventHub) processEventsForPartition(partitionClient *azeventhubs.ProcessorPartitionClient) {
+func (e *EventHub) processEventsForPartition(client *azeventhubs.ProcessorPartitionClient, ps *partitionState) {
 
 	defer func() {
-		err := partitionClient.Close(context.Background())
+		err := client.Close(context.Background())
 		if err != nil {
 			e.Log.Errorf("Error closing partition client: %v", err)
 		}
+		ps.cancel()
 		e.partitionGroup.Done()
 	}()
 
-	e.Log.Infof("Starting to receive for partition %s", partitionClient.PartitionID())
+	e.Log.Infof("Starting to receive for partition %s", client.PartitionID())
 	for {
 		// Wait up to e.BatchInterval for e.BatchSize events, otherwise returns whatever we collected during that time.
 		receiveCtx, cancelReceive := context.WithTimeout(context.Background(), e.BatchInterval)
-		events, err := partitionClient.ReceiveEvents(receiveCtx, e.BatchSize, nil)
+		events, err := client.ReceiveEvents(receiveCtx, e.BatchSize, nil)
 		cancelReceive()
 		if err != nil && !errors.Is(err, context.DeadlineExceeded) {
 			var eventHubError *azeventhubs.Error
 			if errors.As(err, &eventHubError) && eventHubError.Code == azeventhubs.ErrorCodeOwnershipLost {
-				e.Log.Infof("Ownership lost for partition %s", partitionClient.PartitionID())
+				e.Log.Infof("Ownership lost for partition %s", client.PartitionID())
 				return
 			}
-			e.Log.Warnf("Error receiving events on partition %s: %v", partitionClient.PartitionID(), err)
+			e.Log.Warnf("Error receiving events on partition %s: %v", client.PartitionID(), err)
 			return
 		}
+
+		e.Log.Infof("Received %d events for partition %s", len(events), client.PartitionID())
 
 		if len(events) == 0 {
 			continue
 		}
 
+		// Parse and create metrics from the events
 		metrics := make([]telegraf.Metric, 0, len(events))
 		for _, event := range events {
 			if m, err := e.createMetrics(event); err == nil {
@@ -187,15 +219,105 @@ func (e *EventHub) processEventsForPartition(partitionClient *azeventhubs.Proces
 			}
 		}
 
-		// Updates the checkpoint with the latest event received. If processing needs to restart
-		// it will restart from this point, automatically.
-		updateCtx, cancelUpdate := context.WithTimeout(context.Background(), 30*time.Second)
-		err = partitionClient.UpdateCheckpoint(updateCtx, events[len(events)-1], nil)
-		cancelUpdate()
-		if err != nil {
-			e.Log.Errorf("Error updating partition %s checkpoint: %v", partitionClient.PartitionID(), err)
+		// Add the metrics to the accumulator
+		e.addMetricGroup(ps, events[len(events)-1], metrics)
+	}
+}
+
+// newPartitionState creates a new partition state object.
+func (e *EventHub) newPartitionState(ac telegraf.Accumulator) *partitionState {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &partitionState{
+		ac:       ac.WithTracking(e.MaxUndeliveredBatches),
+		ctx:      ctx,
+		cancel:   cancel,
+		sem:      make(semaphore, e.MaxUndeliveredBatches),
+		idMap:    make(map[telegraf.TrackingID]uint64),
+		batchMap: make(map[uint64]batchInfo),
+	}
+}
+
+// addMetricGroup adds a group of metrics to the accumulator, tracking them within the partition state.
+func (e *EventHub) addMetricGroup(ps *partitionState, cp *azeventhubs.ReceivedEventData, metrics []telegraf.Metric) telegraf.TrackingID {
+	ps.sem <- empty{}
+
+	ps.Lock()
+	defer ps.Unlock()
+
+	id := ps.ac.AddTrackingMetricGroup(metrics)
+	ps.idMap[id] = ps.nextAdd
+	ps.batchMap[ps.nextAdd] = batchInfo{
+		metrics:    metrics,
+		checkpoint: cp,
+		delivered:  false,
+	}
+	ps.nextAdd++
+	return id
+}
+
+// onMetricGroupDelivered updates the tracking state for a delivered metric group and returns a checkpoint if possible.
+func (e *EventHub) onMetricGroupDelivered(ps *partitionState, info telegraf.DeliveryInfo) (*azeventhubs.ReceivedEventData, bool) {
+	ps.Lock()
+	defer ps.Unlock()
+
+	// Look up batch information for this tracking ID
+	id := info.ID()
+	idx := ps.idMap[id]
+	delete(ps.idMap, id)
+	if batch, ok := ps.batchMap[idx]; ok {
+
+		// Mark as delivered or retry if undelivered
+		if info.Delivered() {
+			batch.delivered = true
+			ps.batchMap[idx] = batch
+		} else {
+			newId := ps.ac.AddTrackingMetricGroup(batch.metrics)
+			ps.idMap[newId] = idx
+			return nil, false
+		}
+
+	} else {
+		// This should never happen
+		e.Log.Errorf("Failed to find batch info for tracking ID %v / %d", info.ID(), idx)
+	}
+
+	// Check if we can update the checkpoint
+	var checkpoint *azeventhubs.ReceivedEventData
+	update := false
+	for {
+		if batch, ok := ps.batchMap[ps.nextRemove]; ok && batch.delivered {
+			checkpoint = batch.checkpoint
+			update = true
+			delete(ps.batchMap, ps.nextRemove)
+			<-ps.sem
+			ps.nextRemove++
+		} else {
+			break
 		}
 	}
+	return checkpoint, update
+}
+
+// updateCheckpointForPartition updates the checkpoint for a partition based on tracking results.
+func (e *EventHub) updateCheckpointForPartition(client *azeventhubs.ProcessorPartitionClient, ps *partitionState) {
+	defer e.partitionGroup.Done()
+
+	for {
+		select {
+		case <-ps.ctx.Done():
+			return
+		case info := <-ps.ac.Delivered():
+			if checkpoint, update := e.onMetricGroupDelivered(ps, info); update {
+				updateCtx, cancelUpdate := context.WithTimeout(context.Background(), 30*time.Second)
+				err := client.UpdateCheckpoint(updateCtx, checkpoint, nil)
+				cancelUpdate()
+				if err != nil {
+					e.Log.Errorf("Error updating partition %s checkpoint: %v", client.PartitionID(), err)
+				}
+			}
+		}
+	}
+
 }
 
 // createMetrics returns the Metrics from an Event.
