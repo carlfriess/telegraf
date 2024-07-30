@@ -54,14 +54,13 @@ type EventHub struct {
 	IoTHubConnectionAuthMethodTag string   `toml:"iot_hub_connection_auth_method_tag"`
 	IoTHubConnectionModuleIDTag   string   `toml:"iot_hub_connection_module_id_tag"`
 
-	Log telegraf.Logger `toml:"-"`
+	Log    telegraf.Logger `toml:"-"`
+	parser telegraf.Parser
 
 	checkpointStore *checkpoints.BlobStore
 	consumerClient  *azeventhubs.ConsumerClient
 	processorCancel context.CancelFunc
 	partitionGroup  sync.WaitGroup
-
-	parser telegraf.Parser
 }
 
 type partitionState struct {
@@ -112,7 +111,6 @@ func (e *EventHub) Init() (err error) {
 		e.ConsumerGroup = azeventhubs.DefaultConsumerGroup
 	}
 
-	// NOTE: the storageContainerName must exist before the checkpoint store can be used.
 	checkpointClient, err := container.NewClientFromConnectionString(e.StorageConnectionString, e.StorageContainerName, nil)
 	if err != nil {
 		return err
@@ -132,12 +130,9 @@ func (e *EventHub) Init() (err error) {
 }
 
 func (e *EventHub) Start(accumulator telegraf.Accumulator) error {
-
-	e.Log.Info("Starting Event Hub consumer")
-
-	// The Processor handles load balancing with other Processor instances, running in separate
-	// processes or even on separate machines. Each one will use the checkpointStore to coordinate
-	// state and ownership, dynamically.
+	// The Processor handles load balancing with other Processor instances,
+	// running in separate processes or even on separate machines. Each one will
+	// use the checkpointStore to coordinate state and ownership, dynamically.
 	processor, err := azeventhubs.NewProcessor(e.consumerClient, e.checkpointStore, &azeventhubs.ProcessorOptions{
 		Prefetch: e.PrefetchSize,
 	})
@@ -145,15 +140,15 @@ func (e *EventHub) Start(accumulator telegraf.Accumulator) error {
 		return err
 	}
 
-	// Create a context for the processor to run in, so we can cancel it later
+	// Create a context for the processor to run in, so we can cancel it later.
 	var processorCtx context.Context
 	processorCtx, e.processorCancel = context.WithCancel(context.Background())
 
-	// Run in the background, launching goroutines to process each partition
+	// Run in the background, launching goroutines to process each partition.
 	go e.dispatchPartitionClients(processor, accumulator)
 
-	// Run the load balancer. The dispatchPartitionClients goroutine (launched above)
-	// will receive and dispatch ProcessorPartitionClients as partitions are claimed.
+	// Run the load balancer. The dispatchPartitionClients goroutine will
+	// receive and dispatch ProcessorPartitionClients as partitions are claimed.
 	go func() {
 		if err := processor.Run(processorCtx); err != nil {
 			e.Log.Errorf("Error running Event Hub processor: %v", err)
@@ -165,12 +160,15 @@ func (e *EventHub) Start(accumulator telegraf.Accumulator) error {
 
 func (e *EventHub) dispatchPartitionClients(processor *azeventhubs.Processor, ac telegraf.Accumulator) {
 	for {
+		// Wait for the next partition to be claimed
 		processorPartitionClient := processor.NextPartitionClient(context.Background())
 		if processorPartitionClient == nil {
 			// Processor has stopped
 			break
 		}
 
+		// Launch goroutines to receive events and update checkpoints for this
+		// partition once the events have been processed and delivered.
 		ps := e.newPartitionState(ac)
 		e.partitionGroup.Add(2)
 		go e.processEventsForPartition(processorPartitionClient, ps)
@@ -205,8 +203,6 @@ func (e *EventHub) processEventsForPartition(client *azeventhubs.ProcessorPartit
 			return
 		}
 
-		e.Log.Infof("Received %d events for partition %s", len(events), client.PartitionID())
-
 		if len(events) == 0 {
 			continue
 		}
@@ -237,7 +233,8 @@ func (e *EventHub) newPartitionState(ac telegraf.Accumulator) *partitionState {
 	}
 }
 
-// addMetricGroup adds a group of metrics to the accumulator, tracking them within the partition state.
+// addMetricGroup adds a group of metrics to the accumulator, tracking them
+// within the partition state.
 func (e *EventHub) addMetricGroup(ps *partitionState, cp *azeventhubs.ReceivedEventData, metrics []telegraf.Metric) telegraf.TrackingID {
 	ps.sem <- empty{}
 
@@ -255,7 +252,8 @@ func (e *EventHub) addMetricGroup(ps *partitionState, cp *azeventhubs.ReceivedEv
 	return id
 }
 
-// onMetricGroupDelivered updates the tracking state for a delivered metric group and returns a checkpoint if possible.
+// onMetricGroupDelivered updates the tracking state for a delivered metric
+// group and returns a checkpoint if possible.
 func (e *EventHub) onMetricGroupDelivered(ps *partitionState, info telegraf.DeliveryInfo) (*azeventhubs.ReceivedEventData, bool) {
 	ps.Lock()
 	defer ps.Unlock()
@@ -298,7 +296,7 @@ func (e *EventHub) onMetricGroupDelivered(ps *partitionState, info telegraf.Deli
 	return checkpoint, update
 }
 
-// updateCheckpointForPartition updates the checkpoint for a partition based on tracking results.
+// updateCheckpointForPartition continuously updates the checkpoint for a partition based on tracking results.
 func (e *EventHub) updateCheckpointForPartition(client *azeventhubs.ProcessorPartitionClient, ps *partitionState) {
 	defer e.partitionGroup.Done()
 
@@ -322,6 +320,7 @@ func (e *EventHub) updateCheckpointForPartition(client *azeventhubs.ProcessorPar
 
 // createMetrics returns the Metrics from an Event.
 func (e *EventHub) createMetrics(event *azeventhubs.ReceivedEventData) ([]telegraf.Metric, error) {
+	// Parse the event body using the configured parser
 	metrics, err := e.parser.Parse(event.Body)
 	if err != nil {
 		return nil, err
@@ -334,18 +333,19 @@ func (e *EventHub) createMetrics(event *azeventhubs.ReceivedEventData) ([]telegr
 	}
 
 	for i := range metrics {
+		// Add application-specific fields and tags from the event properties
 		for _, field := range e.PropertyFields {
 			if val, ok := event.Properties[field]; ok {
 				metrics[i].AddField(field, val)
 			}
 		}
-
 		for _, tag := range e.PropertyTags {
 			if val, ok := event.Properties[tag]; ok {
 				metrics[i].AddTag(tag, fmt.Sprintf("%v", val))
 			}
 		}
 
+		// Handle the enqueued timestamp according to the configuration
 		if e.EnqueuedTimeAsTs {
 			metrics[i].SetTime(*event.EnqueuedTime)
 		}
@@ -353,6 +353,7 @@ func (e *EventHub) createMetrics(event *azeventhubs.ReceivedEventData) ([]telegr
 			metrics[i].AddField(e.EnqueuedTimeField, (*event.EnqueuedTime).UnixMilli())
 		}
 
+		// Handle the IoT Hub enqueued timestamp according to the configuration
 		if t, ok := event.SystemProperties["iothub-enqueuedtime"].(time.Time); ok {
 			if e.IotHubEnqueuedTimeAsTs {
 				metrics[i].SetTime(t)
@@ -362,6 +363,7 @@ func (e *EventHub) createMetrics(event *azeventhubs.ReceivedEventData) ([]telegr
 			}
 		}
 
+		// Add sequence number and offset fields
 		if e.SequenceNumberField != "" {
 			metrics[i].AddField(e.SequenceNumberField, event.SequenceNumber)
 		}
@@ -369,6 +371,7 @@ func (e *EventHub) createMetrics(event *azeventhubs.ReceivedEventData) ([]telegr
 			metrics[i].AddField(e.OffsetField, event.Offset)
 		}
 
+		// Add IoT Hub connection properties as tags
 		if str, ok := event.SystemProperties["iothub-connection-device-id"].(string); ok && e.IoTHubConnectionDeviceIDTag != "" {
 			metrics[i].AddTag(e.IoTHubConnectionDeviceIDTag, str)
 		}
@@ -387,9 +390,14 @@ func (e *EventHub) createMetrics(event *azeventhubs.ReceivedEventData) ([]telegr
 }
 
 func (e *EventHub) Stop() {
-	e.Log.Info("Stopping Event Hub consumer")
+	// Cancel the processor context to stop claiming new partitions and close
+	// currently owned partitions.
 	e.processorCancel()
+
+	// Wait for all partition processing goroutines to finish
 	e.partitionGroup.Wait()
+
+	// Close the consumer client
 	err := e.consumerClient.Close(context.Background())
 	if err != nil {
 		e.Log.Errorf("Error closing Event Hub connection: %v", err)
