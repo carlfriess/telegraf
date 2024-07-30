@@ -26,6 +26,30 @@ func (d mockDeliveryInfo) Delivered() bool {
 	return d.delivered
 }
 
+func TestInit(t *testing.T) {
+	// Initialize EventHub object
+	e := &EventHub{
+		ConnectionString:        "Endpoint=sb://test-event-hub.servicebus.windows.net/;SharedAccessKeyName=test;SharedAccessKey=testkey;EntityPath=testpath",
+		StorageConnectionString: "BlobEndpoint=https://test.blob.core.windows.net;SharedAccessSignature=sp=racwdli&st=2020-01-01T10:00:00Z&se=2021-01-01T10:00:00Z&spr=https&sv=2022-11-02&sr=c&sig=testsig",
+		StorageContainerName:    "testcontainer",
+
+		Log: testutil.Logger{
+			Name:  "eventhub_consumer_v2",
+			Quiet: true,
+		},
+	}
+	err := e.Init()
+	require.NoError(t, err)
+	require.NotNil(t, e.consumerClient)
+	require.NotNil(t, e.checkpointStore)
+
+	// Check default values
+	require.Equal(t, time.Second, e.BatchInterval)
+	require.Equal(t, 100, e.BatchSize)
+	require.Equal(t, 1000, e.MaxUndeliveredBatches)
+	require.Equal(t, azeventhubs.DefaultConsumerGroup, e.ConsumerGroup)
+}
+
 func TestCreateMetrics(t *testing.T) {
 	// Mock time stamps
 	time1 := time.Now()
