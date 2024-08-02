@@ -39,20 +39,20 @@ type EventHub struct {
 	MaxUndeliveredBatches int           `toml:"max_undelivered_batches"`
 
 	// Metadata
-	EnqueuedTimeAsTs              bool     `toml:"enqueued_time_as_ts"`
-	IotHubEnqueuedTimeAsTs        bool     `toml:"iot_hub_enqueued_time_as_ts"`
-	PropertyFields                []string `toml:"property_fields"`
-	PropertyTags                  []string `toml:"property_tags"`
-	SequenceNumberField           string   `toml:"sequence_number_field"`
-	OffsetField                   string   `toml:"offset_field"`
-	PartitionIDTag                string   `toml:"partition_id_tag"`
-	PartitionKeyTag               string   `toml:"partition_key_tag"`
-	EnqueuedTimeField             string   `toml:"enqueued_time_field"`
-	IoTHubEnqueuedTimeField       string   `toml:"iot_hub_enqueued_time_field"`
-	IoTHubConnectionDeviceIDTag   string   `toml:"iot_hub_connection_device_id_tag"`
-	IoTHubAuthGenerationIDTag     string   `toml:"iot_hub_auth_generation_id_tag"`
-	IoTHubConnectionAuthMethodTag string   `toml:"iot_hub_connection_auth_method_tag"`
-	IoTHubConnectionModuleIDTag   string   `toml:"iot_hub_connection_module_id_tag"`
+	EnqueuedTimeAsTs                    bool     `toml:"enqueued_time_as_ts"`
+	IotHubEnqueuedTimeAsTs              bool     `toml:"iot_hub_enqueued_time_as_ts"`
+	PropertyFields                      []string `toml:"property_fields"`
+	PropertyTags                        []string `toml:"property_tags"`
+	SequenceNumberField                 string   `toml:"sequence_number_field"`
+	OffsetField                         string   `toml:"offset_field"`
+	PartitionIDTag                      string   `toml:"partition_id_tag"`
+	PartitionKeyTag                     string   `toml:"partition_key_tag"`
+	EnqueuedTimeField                   string   `toml:"enqueued_time_field"`
+	IoTHubEnqueuedTimeField             string   `toml:"iot_hub_enqueued_time_field"`
+	IoTHubConnectionDeviceIDTag         string   `toml:"iot_hub_connection_device_id_tag"`
+	IoTHubConnectionAuthGenerationIDTag string   `toml:"iot_hub_connection_auth_generation_id_tag"`
+	IoTHubConnectionAuthMethodTag       string   `toml:"iot_hub_connection_auth_method_tag"`
+	IoTHubConnectionModuleIDTag         string   `toml:"iot_hub_connection_module_id_tag"`
 
 	Log    telegraf.Logger `toml:"-"`
 	parser telegraf.Parser
@@ -375,8 +375,8 @@ func (e *EventHub) createMetrics(event *azeventhubs.ReceivedEventData) ([]telegr
 		if str, ok := event.SystemProperties["iothub-connection-device-id"].(string); ok && e.IoTHubConnectionDeviceIDTag != "" {
 			metrics[i].AddTag(e.IoTHubConnectionDeviceIDTag, str)
 		}
-		if str, ok := event.SystemProperties["iothub-connection-auth-generation-id"].(string); ok && e.IoTHubAuthGenerationIDTag != "" {
-			metrics[i].AddTag(e.IoTHubAuthGenerationIDTag, str)
+		if str, ok := event.SystemProperties["iothub-connection-auth-generation-id"].(string); ok && e.IoTHubConnectionAuthGenerationIDTag != "" {
+			metrics[i].AddTag(e.IoTHubConnectionAuthGenerationIDTag, str)
 		}
 		if str, ok := event.SystemProperties["iothub-connection-auth-method"].(string); ok && e.IoTHubConnectionAuthMethodTag != "" {
 			metrics[i].AddTag(e.IoTHubConnectionAuthMethodTag, str)

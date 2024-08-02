@@ -106,7 +106,7 @@ func TestCreateMetrics(t *testing.T) {
 	e.SequenceNumberField = "sequence_number"
 	e.OffsetField = "offset"
 	e.IoTHubConnectionDeviceIDTag = "device_id"
-	e.IoTHubAuthGenerationIDTag = "auth_gen_id"
+	e.IoTHubConnectionAuthGenerationIDTag = "auth_gen_id"
 	e.IoTHubConnectionAuthMethodTag = "auth_method"
 	e.IoTHubConnectionModuleIDTag = "module_id"
 	metrics, err = e.createMetrics(event)
