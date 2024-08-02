@@ -10,6 +10,7 @@ of this plugin connected to the same Event Hub and consumer group.
 This plugin is also compatible with the Event Hub compatible endpoint of an
 Azure IoT Hub. In addition, the following configuration options can be used to
 annotate metrics with IoT Hub specific metadata:
+
 - `iot_hub_enqueued_time_as_ts`
 - `iot_hub_enqueued_time_field`
 - `iot_hub_connection_device_id_tag`
